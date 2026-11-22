@@ -145,7 +145,8 @@ jobs:
           & .\install-windows.ps1 -Uninstall -RemoveModels
           if (Test-Path "$env:APPDATA\hex\versions") { throw 'uninstall left versions' }
           New-Item -ItemType Directory -Force C:\kit | Out-Null
-          & .\install-windows.ps1 -Tag $env:TAG -DownloadOnly C:\kit
+          # F32 (2.47 GB) ships as two parts, so this also exercises reassembly.
+          & .\install-windows.ps1 -Tag $env:TAG -DownloadOnly C:\kit -ExtraModels F32
           Get-ChildItem C:\kit | Format-Table Name, Length
 
       - name: Offline install as a standard (non-admin) user
@@ -169,7 +170,9 @@ jobs:
           $env:TEMP = Join-Path $env:LOCALAPPDATA 'Temp'; $env:TMP = $env:TEMP
           New-Item -ItemType Directory -Force $env:TEMP | Out-Null
           "user: $(whoami)  admin: $(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
-          & C:\kit\install-windows.ps1 -Offline
+          & C:\kit\install-windows.ps1 -Offline -ExtraModels F32
+          $f32 = Join-Path $env:LOCALAPPDATA 'hex\gguf\parakeet-unified-en-0.6b-F32.gguf'
+          "F32: $((Get-Item $f32).Length) bytes, sha256 $((Get-FileHash $f32 -Algorithm SHA256).Hash.ToLower())"
           $hex = Join-Path $env:APPDATA 'hex\bin\hex.com'
           & $hex --version
           & $hex model status parakeet_unified_en
