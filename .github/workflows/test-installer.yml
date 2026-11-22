@@ -118,7 +118,6 @@ jobs:
           & $hex --version
           & $hex model status parakeet_unified_en
           if ($LASTEXITCODE -ne 0) { throw "model status exited $LASTEXITCODE" }
-          & $hex model list
 
       - name: Transcribe speech offline with the mirrored model
         shell: powershell
