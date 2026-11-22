@@ -253,9 +253,10 @@ def main():
     text, n2 = re.subn(r"(?m)^\$DefaultTag = '.*'$", f"$DefaultTag = '{a.tag}'", text)
     if n1 != 1 or n2 != 1:
         sys.exit("install-windows.ps1: could not stamp $DefaultRepo/$DefaultTag")
-    # Write with CRLF and a UTF-8 BOM so Windows PowerShell 5.1 reads it right.
+    # ASCII with CRLF and no BOM: Windows PowerShell 5.1 reads it the same
+    # from a file, and `irm | iex` would choke on a BOM before param().
     (out / "install-windows.ps1").write_bytes(
-        b"\xef\xbb\xbf" + text.replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-8"))
+        text.replace("\r\n", "\n").replace("\n", "\r\n").encode("ascii"))
 
     manifest = {
         "schema": 1,
