@@ -43,7 +43,7 @@ jobs:
       HF_REVISION: ${{ inputs.hf_revision }}
       HEX_VERSION: ${{ inputs.hex_version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Validate inputs and name the tag
         id: tag

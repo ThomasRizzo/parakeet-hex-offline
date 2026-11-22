@@ -10,11 +10,19 @@ on:
       tag:
         type: string
         required: true
+      script:
+        type: string
+        default: release
   workflow_dispatch:
     inputs:
       tag:
         description: Release tag to test (empty = latest)
         default: ''
+      script:
+        description: Which install-windows.ps1 to pipe into iex
+        type: choice
+        options: [release, repo]
+        default: release
   push:
     branches: [main]
     paths:
@@ -29,7 +37,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: PSScriptAnalyzer (PS 5.1 + 7 syntax)
         shell: pwsh
         run: |
@@ -46,7 +54,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Resolve tag
         shell: bash
@@ -79,8 +87,15 @@ jobs:
 
       - name: Online install (irm | iex, Windows PowerShell 5.1)
         shell: powershell
+        env:
+          SCRIPT: ${{ inputs.script || 'repo' }}
         run: |
-          irm "$env:BASE/install-windows.ps1" | iex
+          if ($env:SCRIPT -eq 'release') {
+            irm "$env:BASE/install-windows.ps1" | iex
+          } else {
+            # The repo copy, piped the same way, against the release under test.
+            & ([scriptblock]::Create((Get-Content -Raw .\install-windows.ps1))) -Tag $env:TAG
+          }
 
       - name: Check the install
         shell: powershell
