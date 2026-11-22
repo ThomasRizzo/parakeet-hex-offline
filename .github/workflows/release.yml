@@ -1,0 +1,120 @@
+name: Build release
+
+# Mirrors the pinned Parakeet GGUF repo, the Silero VAD GGUF Hex downloads at
+# runtime, and the Hex Windows binaries into one GitHub Release, then tests
+# the installer on Windows against it.
+on:
+  workflow_dispatch:
+    inputs:
+      hf_repo:
+        description: Hugging Face model repo
+        default: handy-computer/parakeet-unified-en-0.6b-gguf
+      hf_revision:
+        description: Hugging Face commit (full sha)
+        default: 7e948f21b7bdbac698d3318db9d350f1096f3b6c
+      hex_version:
+        description: Hex version (github.com/anomalyco/hex tag without the v)
+        default: 3.4.0
+      allow_pin_mismatch:
+        description: Publish even if this Hex version pins a different Parakeet revision
+        type: boolean
+        default: false
+      replace_existing:
+        description: Delete and rebuild the release if the tag already exists
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HF_REPO: ${{ inputs.hf_repo }}
+      HF_REVISION: ${{ inputs.hf_revision }}
+      HEX_VERSION: ${{ inputs.hex_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs and name the tag
+        id: tag
+        run: |
+          [[ "$HF_REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::hf_revision must be a full 40-char sha"; exit 1; }
+          [[ "$HEX_VERSION" =~ ^[0-9A-Za-z.+_-]+$ ]] || { echo "::error::bad hex_version"; exit 1; }
+          model=$(basename "$HF_REPO"); model=${model%-gguf}; model=${model%%-unified*}
+          tag="${model}-${HF_REVISION:0:7}-hex-${HEX_VERSION}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "Tag: $tag"
+
+      - name: Check for an existing release
+        run: |
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "${{ inputs.replace_existing }}" = "true" ]; then
+              gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag
+            else
+              echo "::error::Release $TAG exists; rerun with replace_existing to rebuild it"; exit 1
+            fi
+          fi
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Fetch, verify, split, and stage assets
+        run: |
+          args=()
+          [ "${{ inputs.allow_pin_mismatch }}" = "true" ] && args+=(--allow-pin-mismatch)
+          python3 scripts/build_release.py \
+            --hf-repo "$HF_REPO" --hf-revision "$HF_REVISION" --hex-version "$HEX_VERSION" \
+            --repo "$GITHUB_REPOSITORY" --tag "$TAG" --out "$RUNNER_TEMP/stage/release" "${args[@]}"
+          python3 scripts/release_notes.py "$RUNNER_TEMP/stage/release"
+          ls -la "$RUNNER_TEMP/stage/release"
+
+      - name: Publish release
+        run: |
+          cd "$RUNNER_TEMP/stage/release"
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft \
+            --title "Parakeet ${HF_REVISION:0:7} + Hex $HEX_VERSION (Windows, offline)" \
+            --notes-file ../release-notes.md
+          for f in *; do
+            for i in 1 2 3; do
+              gh release upload "$TAG" -R "$GITHUB_REPOSITORY" "$f" --clobber && break
+              echo "retry $f ($i)"; sleep 10
+            done
+          done
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false --latest
+
+      - name: Check the published assets
+        run: |
+          cd "$RUNNER_TEMP/stage/release"
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets \
+            -q '.assets[] | "\(.name) \(.size) \(.digest)"' | sort > ../published.txt
+          for f in *; do
+            want="$(stat -c %s "$f") sha256:$(sha256sum "$f" | cut -d' ' -f1)"
+            got=$(awk -v n="$f" '$1==n {print $2" "$3}' ../published.txt)
+            [ "$got" = "$want" ] || { echo "::error::$f published as '$got', expected '$want'"; exit 1; }
+          done
+          {
+            echo "### Release \`$TAG\`"
+            echo
+            echo "| Asset | Bytes |"; echo "|---|---:|"
+            awk '{print "| `"$1"` | "$2" |"}' ../published.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    needs: build
+    uses: ./.github/workflows/test-installer.yml
+    with:
+      tag: ${{ needs.build.outputs.tag }}

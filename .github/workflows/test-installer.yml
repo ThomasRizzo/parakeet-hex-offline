@@ -1,0 +1,172 @@
+name: Test installer
+
+# Lints install-windows.ps1 and installs a release on a Windows runner with
+# Hugging Face and anoma.ly blocked: online via `irm | iex` (Windows
+# PowerShell 5.1), then air-gapped (-DownloadOnly, then -Offline) as a
+# freshly created standard (non-admin) user.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to test (empty = latest)
+        default: ''
+  push:
+    branches: [main]
+    paths:
+      - install-windows.ps1
+      - PSScriptAnalyzerSettings.psd1
+      - .github/workflows/test-installer.yml
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: PSScriptAnalyzer (PS 5.1 + 7 syntax)
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          $r = Invoke-ScriptAnalyzer -Path ./install-windows.ps1 -Settings ./PSScriptAnalyzerSettings.psd1
+          $r | Format-Table RuleName, Severity, Line, Message -Wrap -AutoSize | Out-String -Width 200
+          if ($r | Where-Object Severity -in 'Error', 'Warning', 'ParseError') { throw 'PSScriptAnalyzer findings' }
+
+  windows:
+    needs: lint
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        shell: bash
+        run: |
+          tag="${{ inputs.tag }}"
+          [ -n "$tag" ] || tag=$(gh release view -R "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "BASE=https://github.com/$GITHUB_REPOSITORY/releases/download/$tag" >> "$GITHUB_ENV"
+          echo "Testing $tag"
+
+      - name: Parse with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $PSVersionTable.PSVersion
+          $t = $null; $e = $null
+          [void][Management.Automation.Language.Parser]::ParseFile("$PWD\install-windows.ps1", [ref]$t, [ref]$e)
+          if ($e) { $e; throw 'parse errors' }
+
+      - name: Block Hugging Face and anoma.ly
+        shell: powershell
+        run: |
+          $hosts = "$env:SystemRoot\System32\drivers\etc\hosts"
+          $names = 'huggingface.co','www.huggingface.co','cdn-lfs.huggingface.co','cdn-lfs-us-1.huggingface.co','cdn-lfs.hf.co','cas-bridge.xethub.hf.co','hf.co','anoma.ly','www.anoma.ly','dev.anoma.ly'
+          Add-Content -Path $hosts -Value ($names | ForEach-Object { "0.0.0.0 $_" })
+          ipconfig /flushdns | Out-Null
+          foreach ($n in 'huggingface.co','anoma.ly') {
+            try { Invoke-WebRequest "https://$n/" -UseBasicParsing -TimeoutSec 10 | Out-Null; throw "$n still reachable" }
+            catch { if ($_.Exception.Message -like '*still reachable*') { throw } ; Write-Host "$n blocked: $($_.Exception.Message)" }
+          }
+
+      - name: Online install (irm | iex, Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          irm "$env:BASE/install-windows.ps1" | iex
+
+      - name: Check the install
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $m = Invoke-RestMethod "$env:BASE/manifest.json"
+          $v = $m.hex.version
+          $models = "$env:LOCALAPPDATA\hex\models"
+          Get-ChildItem $models | Format-Table Name, Length
+          foreach ($e in @($m.models | Where-Object { $_.role -in 'hex-default-model','hex-speech-detector' })) {
+            $f = Join-Path $models $e.path
+            if ((Get-FileHash $f -Algorithm SHA256).Hash.ToLower() -ne $e.sha256) { throw "$f checksum" }
+          }
+          foreach ($f in "$env:APPDATA\hex\versions\$v\hex.exe", "$env:APPDATA\hex\versions\$v\hex.com", "$env:APPDATA\hex\bin\hex.com", "$env:APPDATA\hex\install.json", "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Hex.lnk") {
+            if (-not (Test-Path $f)) { throw "missing $f" }
+          }
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if ($userPath -notlike "*$env:APPDATA\hex\bin*") { throw 'bin not on user PATH' }
+          $hex = "$env:APPDATA\hex\bin\hex.com"
+          & $hex --version
+          & $hex model status parakeet_unified_en
+          if ($LASTEXITCODE -ne 0) { throw "model status exited $LASTEXITCODE" }
+          & $hex model list
+
+      - name: Transcribe speech offline with the mirrored model
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.Speech
+          $wav = "$env:RUNNER_TEMP\sample.wav"
+          $s = New-Object System.Speech.Synthesis.SpeechSynthesizer
+          $fmt = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo 16000, ([System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen), ([System.Speech.AudioFormat.AudioChannel]::Mono)
+          $s.SetOutputToWaveFile($wav, $fmt)
+          $s.Speak('The quick brown fox jumps over the lazy dog. Offline speech recognition works.')
+          $s.Dispose()
+          $hex = "$env:APPDATA\hex\bin\hex.com"
+          $ErrorActionPreference = 'Continue'
+          $text = (& $hex model transcribe $wav --model parakeet_unified_en 2>&1 | Out-String)
+          $code = $LASTEXITCODE
+          Write-Host "exit $code; transcript:`n$text"
+          if ($code -ne 0) { throw "hex model transcribe exited $code" }
+          if ($text -notmatch '(?i)fox' -or $text -notmatch '(?i)dog') { throw 'transcript does not contain the spoken words' }
+          if (Test-Path "$env:LOCALAPPDATA\hex\models\*.partial") { throw 'Hex tried to download a model' }
+
+      - name: Uninstall, then stage an air-gapped kit with the repo's script
+        shell: powershell
+        run: |
+          & .\install-windows.ps1 -Uninstall -RemoveModels
+          if (Test-Path "$env:APPDATA\hex\versions") { throw 'uninstall left versions' }
+          New-Item -ItemType Directory -Force C:\kit | Out-Null
+          & .\install-windows.ps1 -Tag $env:TAG -DownloadOnly C:\kit
+          Get-ChildItem C:\kit | Format-Table Name, Length
+
+      - name: Offline install as a standard (non-admin) user
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = 'hexuser'
+          $plain = 'Hx!' + [guid]::NewGuid().ToString('N').Substring(0, 16) + 'a9'
+          $pw = ConvertTo-SecureString $plain -AsPlainText -Force
+          New-LocalUser -Name $name -Password $pw -PasswordNeverExpires | Out-Null
+          Add-LocalGroupMember -Group 'Users' -Member $name
+          if (Get-LocalGroupMember -Group 'Administrators' | Where-Object Name -like "*\$name") { throw 'test user is an admin' }
+          # The kit must be readable by the new user; logs go to a writable folder.
+          icacls C:\kit /grant "${name}:(OI)(CI)RX" | Out-Null
+          New-Item -ItemType Directory -Force C:\kitlog | Out-Null
+          icacls C:\kitlog /grant "${name}:(OI)(CI)M" | Out-Null
+          $inner = @'
+          $ErrorActionPreference = 'Stop'
+          $env:APPDATA = [Environment]::GetFolderPath('ApplicationData')
+          $env:LOCALAPPDATA = [Environment]::GetFolderPath('LocalApplicationData')
+          $env:TEMP = Join-Path $env:LOCALAPPDATA 'Temp'; $env:TMP = $env:TEMP
+          New-Item -ItemType Directory -Force $env:TEMP | Out-Null
+          "user: $(whoami)  admin: $(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
+          & C:\kit\install-windows.ps1 -Offline
+          $hex = Join-Path $env:APPDATA 'hex\bin\hex.com'
+          & $hex --version
+          & $hex model status parakeet_unified_en
+          if ($LASTEXITCODE -ne 0) { throw "model status exited $LASTEXITCODE" }
+          Get-ChildItem (Join-Path $env:LOCALAPPDATA 'hex\models') | Format-Table Name, Length | Out-String
+          'NONADMIN-OK'
+          '@
+          Set-Content -Path C:\kitlog\run.ps1 -Value $inner -Encoding UTF8
+          icacls C:\kitlog\run.ps1 /grant "${name}:R" | Out-Null
+          $cred = New-Object System.Management.Automation.PSCredential ".\$name", $pw
+          $p = Start-Process powershell.exe -Credential $cred -LoadUserProfile -WorkingDirectory C:\kitlog -Wait -PassThru `
+            -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command',"& C:\kitlog\run.ps1 *> C:\kitlog\out.txt"
+          Get-Content C:\kitlog\out.txt
+          if ($p.ExitCode -ne 0 -or -not (Select-String -Path C:\kitlog\out.txt -Pattern 'NONADMIN-OK' -Quiet)) { throw "non-admin install failed (exit $($p.ExitCode))" }
